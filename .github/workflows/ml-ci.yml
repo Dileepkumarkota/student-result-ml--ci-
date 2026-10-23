@@ -1,4 +1,4 @@
-name: Student Result ML CI-CD
+name: Student Result ML CI-CD and GHCR Publish
 
 on:
   push:
@@ -9,9 +9,10 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
-  train-test-containerize:
+  train-test-publish:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -62,15 +63,59 @@ jobs:
           docker logs student-result-ml-container
           exit 1
 
-      - name: Test prediction endpoint
+      - name: Test prediction endpoint before publishing
         run: |
           response=$(curl --fail --silent --show-error \
             -X POST \
             -H "Content-Type: application/json" \
             -d '{"attendance":90,"internal_marks":85,"assignment_marks":88,"previous_score":80}' \
             http://localhost:5000/predict)
-          echo "Prediction response: $response"
+          echo "Local image prediction response: $response"
           echo "$response" | grep -q '"prediction"'
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag the tested image for GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          docker tag student-result-ml:${{ github.sha }} ghcr.io/dileepkumarkota/student-result-prediction:v1
+          docker tag student-result-ml:${{ github.sha }} ghcr.io/dileepkumarkota/student-result-prediction:latest
+
+      - name: Push versioned and latest tags to GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push ghcr.io/dileepkumarkota/student-result-prediction:v1
+          docker push ghcr.io/dileepkumarkota/student-result-prediction:latest
+
+      - name: Pull published v1 image from GHCR
+        if: github.event_name != 'pull_request'
+        run: docker pull ghcr.io/dileepkumarkota/student-result-prediction:v1
+
+      - name: Validate container pulled from GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          docker rm -f student-result-ml-container
+          docker run -d --name student-result-ml-container -p 5000:5000 ghcr.io/dileepkumarkota/student-result-prediction:v1
+          for i in {1..15}; do
+            if curl --fail --silent http://localhost:5000/health; then
+              echo "GHCR-pulled container health check passed."
+              break
+            fi
+            echo "Waiting for GHCR container... attempt $i"
+            sleep 2
+          done
+          curl --fail --silent --show-error \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"attendance":90,"internal_marks":85,"assignment_marks":88,"previous_score":80}' \
+            http://localhost:5000/predict | tee /tmp/ghcr-prediction.json
+          grep -q '"prediction"' /tmp/ghcr-prediction.json
 
       - name: Show Docker container logs
         if: always()
